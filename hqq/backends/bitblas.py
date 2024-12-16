@@ -7,13 +7,51 @@
 # Only tested on 3090/4090 gpus.
 
 import torch
-import bitblas
+import os
 from torch import float16, Tensor
 
 from ..core.quantize import HQQLinear
 from ..core.peft import HQQLinearLoRA
 from ..core.utils import cleanup
 
+BITBLAS_TARGET = None
+BITBLAS_DATABASE_PATH = None
+BITBLAS_PROPAGATE_WEIGHTS = False
+
+try:
+    import bitblas  # noqa: F401
+    BITBLAS_AVAILABLE = True
+except Exception:
+    BITBLAS_AVAILABLE = False
+
+BITBLAS_INSTALL_HINT = "bitblas not installed. Please install via `pip install bitblas`."
+
+def import_bitblas():
+    # print("import_bitblas() called")
+    global BITBLAS_DATABASE_PATH, BITBLAS_TARGET
+
+    # guard against bitblas pip whl incompatible env`
+    import bitblas
+
+    bitblas.set_log_level("INFO")
+
+    if BITBLAS_TARGET is None:
+        from .bitblas_target_detector import patched_auto_detect_nvidia_target
+
+        bitblas.auto_detect_nvidia_target = patched_auto_detect_nvidia_target
+        BITBLAS_TARGET = patched_auto_detect_nvidia_target(int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")))
+        os.environ["TVM_TARGET"] = f"{BITBLAS_TARGET}"
+        print(f"BITBLAS_TARGET {BITBLAS_TARGET}")
+
+    if BITBLAS_DATABASE_PATH is None:
+        # from importlib.metadata import version
+
+        from bitblas.cache import get_database_path
+
+        # bitblas_version = version(distribution_name="bitblas")
+        # gptqmodel_version = version(distribution_name="gptqmodel")
+
+        BITBLAS_DATABASE_PATH = get_database_path()
 
 @torch.library.custom_op("hqq::matmul_bitblas", mutates_args=())
 def matmul_bitblas(
@@ -49,6 +87,9 @@ class HQQLinearBitBlas(torch.nn.Module):
     def __init__(self, hqq_layer):
         super().__init__()
 
+        import_bitblas()
+        self.target = BITBLAS_TARGET
+        
         self.bias = (
             hqq_layer.bias.data.clone() if (hqq_layer.bias is not None) else None
         )
@@ -106,8 +147,8 @@ class HQQLinearBitBlas(torch.nn.Module):
         )
 
         if self.eng_tag not in HQQLinearBitBlas.ENG_CACHE:
-            HQQLinearBitBlas.ENG_CACHE[self.eng_tag] = bitblas.Matmul(
-                config=matmul_config
+            HQQLinearBitBlas.ENG_CACHE[self.eng_tag] = self._get_or_create_bitblas_operator(
+                config=matmul_config, enable_tuning=True
             )
 
         self.matmul_eng = HQQLinearBitBlas.ENG_CACHE[self.eng_tag]
@@ -117,6 +158,33 @@ class HQQLinearBitBlas(torch.nn.Module):
         self.scale = self.scale.view(self.meta_shape_bitblas)
         torch.cuda.empty_cache()
 
+    def _get_or_create_bitblas_operator(self, config, enable_tuning):
+        from bitblas import Matmul
+        from bitblas.cache import global_operator_cache
+
+        if global_operator_cache.size() == 0:
+            global_operator_cache.load_from_database(
+                BITBLAS_DATABASE_PATH, BITBLAS_TARGET
+            )
+
+        bitblas_matmul = global_operator_cache.get(config)
+        if bitblas_matmul is None:
+            bitblas_matmul = Matmul(config, target=self.target)
+            if enable_tuning:
+                bitblas_matmul.hardware_aware_finetune(topk=20)
+                global_operator_cache.add(config, bitblas_matmul)
+                global_operator_cache.save_into_database(
+                    BITBLAS_DATABASE_PATH, BITBLAS_TARGET
+                )
+                print(
+                    "BitBLAS Tuning done, appended operator to global_operator_cache."
+                )
+            else:
+                print("BitBLAS Operator created.")
+        else:
+            print("BitBLAS Operator found in global_operator_cache.")
+        return bitblas_matmul
+    
     @torch.no_grad()
     def reshape_meta_axis1(self, meta_tensor, new_group_size, shape):
         meta_tensor = meta_tensor.repeat([1, shape[1]]).reshape(shape)

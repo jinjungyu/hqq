@@ -22,6 +22,11 @@ try:
 except Exception:
     patch_hqq_to_gemlite = None
 
+try:
+    from ..backends.autogptq import patch_hqq_to_gptq
+except Exception:
+    patch_hqq_to_gptq = None
+
 def patch_linearlayers(model, fct, patch_param=None, verbose=False):
     base_class = model.base_class if (hasattr(model, "base_class")) else AutoHQQHFModel
     base_class.setup_model(model)
@@ -135,6 +140,11 @@ def prepare_for_inference(model, allow_merge=False, backend="default", verbose=F
             raise RunTimeError('Marlin backend is not available. Check if marlin is correctly installed if you want to use the Marlin backend (https://github.com/IST-DASLab/marlin).')
         else:
             patch_linearlayers(model, patch_hqq_to_marlin, verbose=verbose)
+    if backend == "gptq":
+        if patch_hqq_to_bitblas is None:
+            raise RunTimeError('custom autogptq backend is not available')
+        else:
+            patch_linearlayers(model, patch_hqq_to_gptq, verbose=verbose)
 
     cleanup()
 
